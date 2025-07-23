@@ -73,5 +73,3 @@ Similarly, the results will be printed out in the terminal and added to ./eval/r
 
 ## Acknowledgement
 This repo is built upon the previous work Tabdiff's [[codebase]](https://github.com/MinkaiXu/TabDiff).
-
-```
