@@ -1,0 +1,27 @@
+Metadata-Version: 2.2
+Name: notears
+Version: 3.0
+Summary: Implementation of the NOTEARS algorithm
+Home-page: https://github.com/xunzheng/notears
+Download-URL: https://github.com/xunzheng/notears/archive/v3.0.zip
+Author: Xun Zheng
+Author-email: xzheng1@andrew.cmu.edu
+License: Apache License 2.0
+Keywords: notears causal discovery bayesian network structure learning
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: python-igraph
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: download-url
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: requires-dist
+Dynamic: summary
