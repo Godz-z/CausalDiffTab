@@ -12,6 +12,7 @@ from copy import deepcopy
 from utils_train import update_ema
 
 from tqdm import tqdm
+from tabdiff.models.causal_discovery import extract_causal_mask
 
 BAR = "=============="
 def print_with_bar(log_msg):
@@ -36,6 +37,7 @@ class Trainer:
             device=torch.device('cuda:1'),
             ckpt_path = None,
             y_only=False,
+            max_causal_samples=10000,
             **kwargs
     ):
         self.y_only = y_only
@@ -74,6 +76,7 @@ class Trainer:
         self.model_save_path = model_save_path
         self.result_save_path = result_save_path
         self.ckpt_path = ckpt_path
+        self.max_causal_samples = max_causal_samples
         if self.ckpt_path is not None:
             state_dicts = torch.load(self.ckpt_path, map_location=self.device)
             self.diffusion._denoise_fn.load_state_dict(state_dicts['denoise_fn'])
@@ -82,6 +85,63 @@ class Trainer:
             print(f"Weights are loaded from {self.ckpt_path}")     
         
         self.curr_epoch = int(os.path.basename(self.ckpt_path).split('_')[-1].split('.')[0]) if self.ckpt_path is not None else 0
+        if self.ckpt_path is None:
+            self.extract_and_set_causal_mask()
+
+    def extract_and_set_causal_mask(self):
+    # """从训练集中分别提取数值型和类别型的因果图，并设置到扩散模型中"""
+        all_data = []
+        for i, batch in enumerate(self.train_iter):
+            if len(all_data) * self.batch_size >= self.max_causal_samples:
+                break
+            all_data.append(batch)
+    #设置缓存
+        save_dir = "./causal_masks/adult"
+        os.makedirs(save_dir, exist_ok=True)
+        num_causal_path = os.path.join(save_dir, "num_causal_mask.npy")
+        cat_causal_path = os.path.join(save_dir, "cat_causal_mask.npy")
+    # 拼接所有批次的数据
+        combined_data = torch.cat(all_data, dim=0)
+        x_num = combined_data[:, :self.diffusion.num_numerical_features]
+        x_cat = combined_data[:, self.diffusion.num_numerical_features:].long()
+
+    # 转换类别型特征为独热编码
+        x_cat_one_hot = self.diffusion.to_one_hot(x_cat)
+
+    # 提取数值型特征的因果图
+        if os.path.exists(num_causal_path):
+            print("检测到数值型因果图缓存文件，正在加载...")
+            num_causal_mask = np.load(num_causal_path)
+        else:
+            num_column_names = [f"num_{i}" for i in range(x_num.shape[1])]
+            num_data_df = pd.DataFrame(x_num.cpu().numpy(), columns=num_column_names)
+            print("数值型特征统计：")
+            print(num_data_df.describe())
+            print("Extracting causal mask for numerical features...")
+            num_causal_mask = extract_causal_mask(num_data_df)
+            print(f"Numerical causal mask shape: {num_causal_mask.shape}")
+    # 保存因果图     
+            np.save(num_causal_path, num_causal_mask)
+
+    # 提取类别型特征的因果图
+        if os.path.exists(cat_causal_path):
+            print("检测到类别型因果图缓存文件，正在加载...")
+            cat_causal_mask = np.load(cat_causal_path)
+        else:
+            cat_column_names = [f"cat_{i}" for i in range(x_cat_one_hot.shape[1])]
+            cat_data_df = pd.DataFrame(x_cat_one_hot.cpu().numpy(), columns=cat_column_names)
+            print("类别型特征稀疏性：")
+            print((cat_data_df.sum() / len(cat_data_df)).describe())
+            print("Extracting causal mask for categorical features...")
+            cat_causal_mask = extract_causal_mask(cat_data_df, is_categorical = True)
+            print(f"Categorical causal mask shape: {cat_causal_mask.shape}")
+
+    # 保存因果图
+            np.save(cat_causal_path, cat_causal_mask)
+
+    # 设置因果图到扩散模型
+        self.diffusion.set_causal_masks(num_causal_mask, cat_causal_mask)
+        print("Numerical and categorical causal masks have been extracted and set to the diffusion model.")
 
     def _anneal_lr(self, step):
         frac_done = step / self.steps
@@ -96,7 +156,7 @@ class Trainer:
 
         self.optimizer.zero_grad()
 
-        dloss, closs = self.diffusion.mixed_loss(x)
+        dloss, closs = self.diffusion.mixed_loss(x, self.curr_epoch)
 
         loss = dloss_weight * dloss + closs_weight * closs
         loss.backward()
@@ -113,7 +173,7 @@ class Trainer:
             x = batch.float().to(self.device)
             self.diffusion.eval()
             with torch.no_grad():
-                batch_dloss, batch_closs = self.diffusion.mixed_loss(x)
+                batch_dloss, batch_closs = self.diffusion.mixed_loss(x, self.curr_epoch)
             curr_dloss += batch_dloss.item() * len(x)
             curr_closs += batch_closs.item() * len(x)
             curr_count += len(x)
@@ -189,7 +249,6 @@ class Trainer:
                 "loss/total_loss": total_loss
             }
             log_dict.update(loss_dict)
-            
             # Log the learned noise schedules for numerical dimensions
             num_noise_dict = {}
             if self.diffusion.num_schedule.rho().dim() > 0 and len(self.diffusion.num_schedule.rho()) > 1:
@@ -434,14 +493,31 @@ class Trainer:
                     raise NotImplementedError(f"Extra file generated during evaluations has type {type(extra)}, and code to save this type of file is not implemented")
         
         # Plot density figures
+        # if plot_density:
+        #     img, sub_imgs = self.metrics.plot_density(syn_df_loaded)
+        #     path = os.path.join(save_path, "density_plots.png")
+        #     img.save(path)
+        #     print(
+        #         f"The density plots are saved at {path}"
+        #     )
+        #         # 保存每个子图为 PDF
+        #     subplot_dir = os.path.join(save_path, "subplots_pdf")
+        #     os.makedirs(subplot_dir, exist_ok=True)
+
+        #     for idx, sub_img in enumerate(sub_imgs):
+        #         pdf_path = os.path.join(subplot_dir, f"subplot_{idx}.pdf")
+        # # 将 PIL Image 转换为 PDF 并保存
+        #         sub_img.save(pdf_path, save_all=True, append_images=[sub_img])
+        # return out_metrics, extras, syn_df
         if plot_density:
-            img = self.metrics.plot_density(syn_df_loaded)
-            path = os.path.join(save_path, "density_plots.png")
-            img.save(path)
-            print(
-                f"The density plots are saved at {path}"
-            )
-        return out_metrics, extras, syn_df
+    # 获取密度图数据（真实 vs 合成）
+            density_data = self.metrics.plot_density(syn_df_loaded)
+
+    # 保存为 JSON 文件
+            path = os.path.join(save_path, "density_data.json")
+            with open(path, 'w') as f:
+                json.dump(density_data, f, indent=4)
+            print(f"Density data saved at {path}")
         
 
     def sample_synthetic(self, num_samples, keep_nan_samples=True, ema=False):
