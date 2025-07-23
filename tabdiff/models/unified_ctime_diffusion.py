@@ -31,6 +31,8 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
             noise_schedule_params={},
             sampler_params={},
             device=torch.device('cpu'),
+            causal_weight_max: float = 1.0,    # 新增参数
+            causal_warmup_steps: int = 4000,   # 新增参数
             **kwargs
         ):
 
@@ -67,14 +69,17 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
         self.edm_params = edm_params
         self.noise_dist_params = noise_dist_params
         self.sampler_params = sampler_params
-        
+        self.causal_weight_max = causal_weight_max
+        self.causal_warmup_steps = causal_warmup_steps
+        self.ema_loss = None
         self.w_num = 0.0
         self.w_cat = 0.0
         self.num_mask_idx = []
         self.cat_mask_idx = []
         
         self.device = device
-        
+        self.register_buffer('num_causal_mask', None)
+        self.register_buffer('cat_causal_mask', None)
         if self.scheduler == 'power_mean':
             self.num_schedule = PowerMeanNoise(**noise_schedule_params)
         elif self.scheduler == 'power_mean_per_column':
@@ -88,8 +93,124 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
             self.cat_schedule = LogLinearNoise_PerColumn(num_categories = len(num_classes), **noise_schedule_params)
         else:
             raise NotImplementedError(f"The noise schedule--{self.cat_scheduler}-- is not implemented for discrete data at CTIME ")
+        
+    def set_causal_masks(self, num_causal_mask, cat_causal_mask):
+        """设置因果掩码（支持 numpy 数组或 PyTorch 张量）"""
+        if isinstance(num_causal_mask, np.ndarray):
+            num_causal_mask = torch.from_numpy(num_causal_mask).float()  # 先转为 Tensor
+        else:
+            num_causal_mask = num_causal_mask.float()       
+        if isinstance(cat_causal_mask, np.ndarray):
+            cat_causal_mask = torch.from_numpy(cat_causal_mask).float()
+        else:
+            cat_causal_mask = cat_causal_mask.float()
+            
+    # def set_causal_masks(self, num_causal_mask):
+    #     """设置因果掩码（支持 numpy 数组或 PyTorch 张量）"""
+    #     if isinstance(num_causal_mask, np.ndarray):
+    #         num_causal_mask = torch.from_numpy(num_causal_mask).float()  # 先转为 Tensor
+    #     else:
+    #         num_causal_mask = num_causal_mask.float()       
+        # 注册为 buffer 并移动到设备
+        self.register_buffer('num_causal_mask', num_causal_mask.to(self.device))
+        self.register_buffer('cat_causal_mask', cat_causal_mask.to(self.device))
+    
+    # def _causal_regularization_loss(self, pred_x, x_t, noise, sigma, is_categorical=False, current_step=0):
+    # # """
+    # # 通用因果正则化损失（支持数值型和类别型）
+    # # Args:
+    # #     pred_x: 模型预测的干净数据 (batch, features)
+    # #     x_t: 带噪声的数据 (batch, features)
+    # #     noise: 添加的噪声（数值型为高斯噪声，类别型为转移概率）
+    # #     sigma: 噪声水平 (batch, features)
+    # #     is_categorical: 是否为类别型特征
+    # #     current_step: 当前训练步数（用于动态权重计算）
+    # # """
+    #     batch_size = pred_x.size(0)
+    #     num_features = pred_x.size(1)
 
-    def mixed_loss(self, x):
+    # # 动态权重计算（课程学习策略）
+    # # 参数建议：在类初始化时设置 self.causal_weight_max, self.causal_warmup_steps
+    #     if current_step < self.causal_warmup_steps:
+    #         weight = self.causal_weight_max * (1 - math.cos(math.pi * current_step / self.causal_warmup_steps)) / 2
+    #     else:
+    #         weight = self.causal_weight_max
+
+    #     if is_categorical:
+    #     # 扩展 sigma 到 one-hot 维度
+    #         sigma_expanded = sigma.repeat_interleave(
+    #             torch.tensor(self.num_classes, device=sigma.device),
+    #             dim=1
+    #         )
+        
+    #     # 计算类别型噪声误差
+    #         log_probs = F.log_softmax(pred_x, dim=-1)
+    #         target = x_t.argmax(dim=-1)
+    #         # noise_loss = F.nll_loss(log_probs, target)
+        
+    #     # 计算因果方向导数
+    #         probs = torch.exp(log_probs)
+    #         grad_matrix = torch.einsum('bi,bj->bij', probs, probs)
+
+    #     else:
+    #     # 数值型噪声误差
+    #         noise_pred = (x_t - pred_x) / sigma
+    #         # noise_loss = F.mse_loss(noise_pred, noise)
+        
+    #     # 计算因果方向导数
+    #         grad_matrix = torch.einsum('bi,bj->bij', noise_pred, noise_pred)
+    
+    # # 应用因果掩码
+    #     mask = self.cat_causal_mask.unsqueeze(0) if is_categorical else self.num_causal_mask.unsqueeze(0)
+    #     masked_grad = grad_matrix * mask
+    
+    # # 因果一致性损失
+    #     causal_consistency = masked_grad.mean()
+    # # 总损失 = 基础噪声损失 + 加权因果约束
+    #     total_loss = causal_consistency * weight
+    
+    #     return total_loss
+    def _causal_regularization_loss(self, pred_x, x_t, noise, sigma, is_categorical=False, current_step=0):
+    # """
+    # 通用因果正则化损失（支持数值型和类别型）
+    # Args:
+    #     pred_x: 模型预测的干净数据 (batch, features)
+    #     x_t: 带噪声的数据 (batch, features)
+    #     noise: 添加的噪声（数值型为高斯噪声，类别型为转移概率）
+    #     sigma: 噪声水平 (batch, features)
+    #     is_categorical: 是否为类别型特征
+    #     current_step: 当前训练步数（用于动态权重计算）
+    # """
+        # batch_size = pred_x.size(0)
+        # num_features = pred_x.size(1)
+
+    # 计算因果方向导数和基础损失（原有逻辑保持不变）
+        if is_categorical:
+        # 扩展 sigma 到 one-hot 维度
+            # sigma_expanded = sigma.repeat_interleave(
+            #     torch.tensor(self.num_classes, device=sigma.device),
+            #     dim=1
+            # )
+        # 计算类别型噪声误差
+            log_probs = F.log_softmax(pred_x, dim=-1)
+            target = x_t.argmax(dim=-1)
+        # 计算因果方向导数
+            probs = torch.exp(log_probs)
+            grad_matrix = torch.einsum('bi,bj->bij', probs, probs)
+        else:
+        # 数值型噪声误差
+            noise_pred = (x_t - pred_x) / sigma
+        # 计算因果方向导数
+            grad_matrix = torch.einsum('bi,bj->bij', noise_pred, noise_pred)
+    
+    # 应用因果掩码（原有逻辑保持不变）
+        mask = self.cat_causal_mask.unsqueeze(0) if is_categorical else self.num_causal_mask.unsqueeze(0)
+        masked_grad = grad_matrix * mask
+        causal_consistency = masked_grad.mean()
+        total_loss = causal_consistency * 1
+        return total_loss
+    
+    def mixed_loss(self, x, current_training_step=None):
         b = x.shape[0]
         device = x.device
 
@@ -136,7 +257,6 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
             x_num_t, x_cat_t_soft,
             t.squeeze(), sigma=sigma_num
         )
-
         d_loss = torch.zeros((1,)).float()
         c_loss = torch.zeros((1,)).float()
 
@@ -145,8 +265,17 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
         if x_cat.shape[1] > 0:
             logits = self._subs_parameterization(model_out_cat, x_cat_t)    # log normalized probabilities, with the entry mask category being set to -inf
             d_loss = self._absorbed_closs(logits, x_cat, sigma_cat, dsigma_cat)
-            
-        return d_loss.mean(), c_loss.mean()
+        cat_causal_loss = torch.tensor(0.0, device=x.device)
+        causal_loss = torch.tensor(0.0, device=x.device)
+        if self.cat_causal_mask is not None and x_cat.shape[1] > 0:
+            cat_causal_loss = self._causal_regularization_loss(
+                model_out_cat, x_cat_t_soft, noise=None, sigma=sigma_cat, is_categorical=True, current_step=current_training_step
+                )
+        if self.num_causal_mask is not None and x_num.shape[1] > 0:
+            causal_loss = self._causal_regularization_loss(
+                model_out_num, x_num_t, noise, sigma_num, current_step=current_training_step
+            )
+        return d_loss.mean()+ cat_causal_loss, c_loss.mean()+ causal_loss
 
     @torch.no_grad()
     def sample(self, num_samples):
